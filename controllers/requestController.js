@@ -1,16 +1,19 @@
 const pool = require('../config/db');
+const { movePreMessages } = require('./preMessageController');
 require('dotenv').config();
 
-// Send a chat request to someone
+const PRE_LIMIT = 5;
+
+// Send a chat request to someone (only after the sender has used all pre-request messages)
 async function sendRequest(req, res) {
-  const senderId = req.user.userId;
-  const { receiverId } = req.body;
+  const senderId = Number(req.user.userId);
+  const receiverId = Number(req.body.receiverId);
 
   if (!receiverId) {
     return res.status(400).json({ message: 'receiverId is required' });
   }
 
-  if (parseInt(receiverId) === senderId) {
+  if (receiverId === senderId) {
     return res.status(400).json({ message: 'You cannot send a request to yourself' });
   }
 
@@ -21,11 +24,11 @@ async function sendRequest(req, res) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Check if a pending or accepted request already exists
+    // Check if a pending or accepted request already exists (either direction)
     const [existing] = await pool.query(
-      `SELECT * FROM chat_requests 
+      `SELECT id FROM chat_requests
        WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
-       AND status IN ('pending', 'accepted')`,
+         AND status IN ('pending', 'accepted')`,
       [senderId, receiverId, receiverId, senderId]
     );
 
@@ -33,14 +36,34 @@ async function sendRequest(req, res) {
       return res.status(400).json({ message: 'Request already sent or connection already exists' });
     }
 
+    // Pre-request messages: request tabhi bhej sakte hain jab 5 messages poore ho chuke hon
+    const [[countRow]] = await pool.query(
+      'SELECT COUNT(*) AS c FROM pre_request_messages WHERE sender_id = ? AND receiver_id = ?',
+      [senderId, receiverId]
+    );
+    const sent = Number(countRow.c);
+    if (sent < PRE_LIMIT) {
+      return res.status(403).json({
+        code: 'MESSAGES_PENDING',
+        message: `Request bhejne se pehle ${PRE_LIMIT} messages bhejne honge. Abhi ${sent} bheje hain.`,
+        sent,
+        limit: PRE_LIMIT,
+      });
+    }
+
     const [result] = await pool.query(
-      'INSERT INTO chat_requests (sender_id, receiver_id, status) VALUES (?, ?, "pending")',
+      `INSERT INTO chat_requests (sender_id, receiver_id, status) VALUES (?, ?, 'pending')`,
       [senderId, receiverId]
     );
 
-    // Use socket instance from app to send real-time notification
+    // Real-time notification (socket instance app se aata hai)
     const io = req.app.get('io');
-    io.to(`user_${receiverId}`).emit('chat_request', { from: senderId, requestId: result.insertId });
+    if (io) {
+      io.to(`user_${receiverId}`).emit('chat_request', {
+        from: senderId,
+        requestId: result.insertId,
+      });
+    }
 
     res.json({ message: 'Request sent successfully', requestId: result.insertId });
   } catch (err) {
@@ -51,7 +74,7 @@ async function sendRequest(req, res) {
 
 // Get all incoming pending requests
 async function getIncoming(req, res) {
-  const userId = req.user.userId;
+  const userId = Number(req.user.userId);
 
   try {
     const [rows] = await pool.query(
@@ -70,14 +93,14 @@ async function getIncoming(req, res) {
   }
 }
 
-// Accept a request — also creates a conversation
+// Accept a request: creates a conversation and moves pre-request messages into it
 async function acceptRequest(req, res) {
-  const userId = req.user.userId;
+  const userId = Number(req.user.userId);
   const { id } = req.params;
 
   try {
     const [rows] = await pool.query(
-      'SELECT * FROM chat_requests WHERE id = ? AND receiver_id = ? AND status = "pending"',
+      `SELECT * FROM chat_requests WHERE id = ? AND receiver_id = ? AND status = 'pending'`,
       [id, userId]
     );
 
@@ -86,9 +109,9 @@ async function acceptRequest(req, res) {
     }
 
     const request = rows[0];
-    await pool.query('UPDATE chat_requests SET status = "accepted" WHERE id = ?', [id]);
+    await pool.query(`UPDATE chat_requests SET status = 'accepted' WHERE id = ?`, [id]);
 
-    // Create conversation — user1_id is always the smaller ID
+    // user1_id is always the smaller ID
     const user1 = Math.min(request.sender_id, request.receiver_id);
     const user2 = Math.max(request.sender_id, request.receiver_id);
 
@@ -96,14 +119,20 @@ async function acceptRequest(req, res) {
       'INSERT INTO conversations (user1_id, user2_id, last_message_at) VALUES (?, ?, NOW())',
       [user1, user2]
     );
+    const convId = convResult.insertId;
+
+    // Pre-request messages ko normal chat mein move karo
+    await movePreMessages(request.sender_id, request.receiver_id, convId);
 
     const io = req.app.get('io');
-    io.to(`user_${request.sender_id}`).emit('request_accepted', {
-      convId: convResult.insertId,
-      by: userId
-    });
+    if (io) {
+      io.to(`user_${request.sender_id}`).emit('request_accepted', {
+        convId,
+        by: userId,
+      });
+    }
 
-    res.json({ message: 'Request accepted successfully', convId: convResult.insertId });
+    res.json({ message: 'Request accepted successfully', conversation_id: convId, convId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -112,12 +141,12 @@ async function acceptRequest(req, res) {
 
 // Reject a request (sender is not notified)
 async function rejectRequest(req, res) {
-  const userId = req.user.userId;
+  const userId = Number(req.user.userId);
   const { id } = req.params;
 
   try {
     const [rows] = await pool.query(
-      'SELECT * FROM chat_requests WHERE id = ? AND receiver_id = ? AND status = "pending"',
+      `SELECT id FROM chat_requests WHERE id = ? AND receiver_id = ? AND status = 'pending'`,
       [id, userId]
     );
 
@@ -125,7 +154,7 @@ async function rejectRequest(req, res) {
       return res.status(404).json({ message: 'Request not found' });
     }
 
-    await pool.query('UPDATE chat_requests SET status = "rejected" WHERE id = ?', [id]);
+    await pool.query(`UPDATE chat_requests SET status = 'rejected' WHERE id = ?`, [id]);
     res.json({ message: 'Request rejected successfully' });
   } catch (err) {
     console.error(err);
@@ -133,7 +162,7 @@ async function rejectRequest(req, res) {
   }
 }
 
-// Share link fallback — when the receiver doesn't know the User ID
+// Share link fallback: when the receiver doesn't know the User ID
 function getShareLink(req, res) {
   const { userId } = req.params;
   const link = `${process.env.CLIENT_URL}/add/${userId}`;
